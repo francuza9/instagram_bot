@@ -135,7 +135,8 @@ def find_new_messages(messages, last_timestamp, replied_timestamps, bot_user_id)
     """Find new text messages, filtering out non-text, already-replied, and own messages."""
     new_msgs = []
     for msg in messages:
-        if msg.user_id == bot_user_id:
+        if int(msg.user_id) == int(bot_user_id):
+            log.debug(f"Skipping self-message (user_id={msg.user_id}): {msg.text[:60] if msg.text else '<no text>'}")
             continue
         if last_timestamp is not None and msg.timestamp <= last_timestamp:
             continue
@@ -248,10 +249,14 @@ def main():
     except Exception as e:
         log.warning(f"Failed to pre-cache usernames from thread info: {e}")
 
+    bot_user_id = int(ig_client.user_id)
+    log.info(f"Bot user_id: {bot_user_id} (type: {type(bot_user_id).__name__})")
+
     print()
     print("=" * 50)
     print(f"  Instagram Bot Active")
     print(f"  Account:  @{username}")
+    print(f"  User ID:  {bot_user_id}")
     print(f"  Thread:   {thread_id}")
     print(f"  Bot name: @{bot_name}")
     print(f"  Model:    llama-3.3-70b-versatile (Groq)")
@@ -272,7 +277,7 @@ def main():
                 log.debug(f"Initial last_timestamp set to {last_timestamp}")
                 first_run = False
             else:
-                mentions = find_new_messages(messages, last_timestamp, replied_timestamps, ig_client.user_id)
+                mentions = find_new_messages(messages, last_timestamp, replied_timestamps, bot_user_id)
                 new_latest = get_latest_timestamp(messages)
                 if new_latest and (last_timestamp is None or new_latest > last_timestamp):
                     last_timestamp = new_latest
