@@ -12,7 +12,8 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from uuid import uuid4
+
+import requests
 
 from dotenv import load_dotenv
 from groq import Groq
@@ -51,6 +52,8 @@ log = logging.getLogger(__name__)
 
 # --- Global state ---
 running = True
+_web_tokens = {}
+_web_session = None
 
 
 def handle_signal(signum, frame):
@@ -199,86 +202,196 @@ def send_reply(ig_client, thread_id, text):
     log.info(f"Sent text reply: {text[:80]}{'...' if len(text) > 80 else ''}")
 
 
-def direct_send_voice(cl, path, thread_id):
-    """Send a voice note to a DM thread using instagrapi's low-level API."""
-    path = Path(path)
-    upload_id = str(int(time.time() * 1000))
-    upload_name = f"{upload_id}_0_{random.randint(1000000000, 9999999999)}"
 
-    # Get audio duration via ffprobe
-    probe = subprocess.run(
-        ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
-         "-of", "csv=p=0", str(path)],
-        capture_output=True, text=True,
-    )
-    duration_ms = int(float(probe.stdout.strip()) * 1000)
 
-    # Upload via rupload_igvideo (Instagram uses video endpoint for voice)
-    rupload_params = {
-        "retry_context": '{"num_step_auto_retry":0,"num_reupload":0,"num_step_manual_retry":0}',
-        "media_type": "11",
-        "upload_id": upload_id,
-        "upload_media_duration_ms": str(duration_ms),
-        "is_direct_voice": "1",
-        "direct_v2": "1",
-        "xsharing_user_ids": json.dumps([cl.user_id]),
-    }
+def _get_web_session(username, password):
+    global _web_session
+    if _web_session is not None:
+        return _web_session
 
-    with open(path, "rb") as f:
-        audio_data = f.read()
-    audio_len = str(len(audio_data))
-
-    headers = {
-        "Accept-Encoding": "gzip, deflate",
-        "X-Instagram-Rupload-Params": json.dumps(rupload_params),
-        "X_FB_VIDEO_WATERFALL_ID": str(uuid4()),
-    }
-
-    # Register upload
-    cl.private.get(
-        f"https://i.instagram.com/rupload_igvideo/{upload_name}",
-        headers=headers,
-    )
-
-    # POST the audio data
-    upload_headers = {
-        "Offset": "0",
-        "X-Entity-Name": upload_name,
-        "X-Entity-Length": audio_len,
-        "Content-Type": "application/octet-stream",
-        "Content-Length": audio_len,
-        "X-Entity-Type": "video/mp4",
-        **headers,
-    }
-    cl.private.post(
-        f"https://i.instagram.com/rupload_igvideo/{upload_name}",
-        data=audio_data,
-        headers=upload_headers,
-    )
-
-    # Broadcast as voice note
-    token = cl.generate_mutation_token()
-    data = cl.with_default_data({
-        "action": "send_item",
-        "is_shh_mode": "0",
-        "send_attribution": "direct_thread",
-        "client_context": token,
-        "mutation_token": token,
-        "offline_threading_id": token,
-        "thread_ids": json.dumps([int(thread_id)]),
-        "upload_id": upload_id,
-        "waveform": json.dumps([0.5] * 20),
-        "waveform_sampling_frequency_hz": "10",
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
     })
 
-    cl.private_request(
-        "direct_v2/threads/broadcast/share_voice/",
-        data=data,
-        with_signature=False,
+    # GET homepage to pick up initial csrftoken cookie
+    session.get("https://www.instagram.com/")
+    csrf = session.cookies.get("csrftoken", "")
+
+    # Web login
+    resp = session.post(
+        "https://www.instagram.com/accounts/login/ajax/",
+        data={
+            "username": username,
+            "enc_password": f"#PWD_INSTAGRAM_BROWSER:0:{int(time.time())}:{password}",
+            "queryParams": "{}",
+            "optIntoOneTap": "false",
+        },
+        headers={
+            "X-CSRFToken": csrf,
+            "X-IG-App-ID": "936619743392459",
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": "https://www.instagram.com/",
+        },
+    )
+    resp.raise_for_status()
+    data = resp.json()
+
+    if not data.get("authenticated"):
+        raise RuntimeError(f"Web login failed: {data}")
+
+    log.info("Web login successful")
+    _web_session = session
+    return _web_session
+
+
+def fetch_web_tokens(username, password):
+    global _web_tokens
+    if _web_tokens:
+        return _web_tokens
+
+    session = _get_web_session(username, password)
+    resp = session.get("https://www.instagram.com/direct/")
+    resp.raise_for_status()
+    html = resp.text
+
+    fb_dtsg_match = re.search(r'"DTSGInitData".*?"token"\s*:\s*"([^"]+)"', html, re.DOTALL)
+    lsd_match = re.search(r'"LSD".*?"token"\s*:\s*"([^"]+)"', html, re.DOTALL)
+    jazoest_match = re.search(r'jazoest=(\d+)', html)
+
+    missing = []
+    if not fb_dtsg_match:
+        missing.append("fb_dtsg")
+    if not lsd_match:
+        missing.append("lsd")
+    if not jazoest_match:
+        missing.append("jazoest")
+    if missing:
+        # Dump snippets around known markers for debugging
+        for keyword in ("DTSGInitData", "dtsg", "LSD", "jazoest"):
+            idx = html.find(keyword)
+            if idx != -1:
+                snippet = html[max(0, idx - 20):idx + 120]
+                log.debug(f"HTML near '{keyword}': ...{snippet}...")
+            else:
+                log.debug(f"'{keyword}' not found in HTML ({len(html)} chars)")
+        raise RuntimeError(f"Failed to extract web tokens: {', '.join(missing)}")
+
+    _web_tokens = {
+        "fb_dtsg": fb_dtsg_match.group(1),
+        "lsd": lsd_match.group(1),
+        "jazoest": jazoest_match.group(1),
+    }
+    log.info("Fetched web tokens (fb_dtsg, lsd, jazoest)")
+    return _web_tokens
+
+
+def upload_web_audio(username, password, audio_path):
+    session = _get_web_session(username, password)
+    tokens = fetch_web_tokens(username, password)
+
+    with open(audio_path, "rb") as f:
+        audio_data = f.read()
+
+    params = {
+        "__d": "www",
+        "__user": "0",
+        "__a": "1",
+        "__ccg": "GOOD",
+        "__comet_req": "7",
+        "__crn": "comet.igweb.PolarisDirectInboxRoute",
+        "dpr": "1",
+        "fb_dtsg": tokens["fb_dtsg"],
+        "lsd": tokens["lsd"],
+        "jazoest": tokens["jazoest"],
+    }
+
+    url = "https://www.instagram.com/ajax/mercury/upload.php"
+    log.info(f"Upload URL: {url}")
+    log.info(f"Upload headers: {dict(session.headers)}")
+    log.info(f"Upload params: {params}")
+
+    resp = session.post(
+        url,
+        params=params,
+        headers={
+            "X-FB-LSD": tokens["lsd"],
+            "X-CSRFToken": session.cookies.get("csrftoken", ""),
+            "X-ASBD-ID": "359341",
+            "X-IG-App-ID": "936619743392459",
+            "Origin": "https://www.instagram.com",
+            "Referer": "https://www.instagram.com/direct/",
+        },
+        files={"farr": ("reply.m4a", audio_data, "audio/mp4")},
     )
 
+    log.info(f"Upload response status: {resp.status_code}")
+    log.info(f"Upload response body: {resp.text[:2000]}")
+    resp.raise_for_status()
 
-def send_voice_reply(ig_client, thread_id, text):
+    body = resp.text
+    if body.startswith("for (;;);"):
+        body = body[len("for (;;);"):]
+
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError as e:
+        log.error(f"Failed to parse upload JSON: {e}\nBody: {body[:500]}")
+        raise
+
+    try:
+        audio_id = data["payload"]["metadata"]["0"]["audio_id"]
+    except (KeyError, TypeError) as e:
+        log.error(f"Failed to extract audio_id: {e}\nParsed data: {json.dumps(data, indent=2)[:1000]}")
+        raise
+
+    log.info(f"Uploaded audio, got audio_id={audio_id}")
+    return audio_id
+
+
+def send_web_voice(username, password, thread_id, audio_id):
+    session = _get_web_session(username, password)
+    tokens = fetch_web_tokens(username, password)
+
+    variables = json.dumps({
+        "attachment_fbid": str(audio_id),
+        "thread_id": str(thread_id),
+        "offline_threading_id": str(random.randint(10**17, 10**18 - 1)),
+        "reply_to_message_id": None,
+    })
+
+    resp = session.post(
+        "https://www.instagram.com/api/graphql",
+        headers={
+            "X-FB-Friendly-Name": "IGDirectMediaSendMutation",
+            "X-CSRFToken": session.cookies.get("csrftoken", ""),
+            "X-IG-App-ID": "936619743392459",
+            "X-FB-LSD": tokens["lsd"],
+        },
+        data={
+            "fb_api_req_friendly_name": "IGDirectMediaSendMutation",
+            "doc_id": "25604816565789936",
+            "variables": variables,
+            "fb_dtsg": tokens["fb_dtsg"],
+            "lsd": tokens["lsd"],
+            "jazoest": tokens["jazoest"],
+            "__a": "1",
+            "__d": "www",
+            "__comet_req": "7",
+            "server_timestamps": "true",
+        },
+    )
+
+    if resp.status_code in (401, 403):
+        _web_tokens.clear()
+        raise RuntimeError(f"GraphQL auth error: {resp.status_code}")
+
+    resp.raise_for_status()
+    log.info("Voice message sent via GraphQL")
+
+
+def send_voice_reply(username, password, thread_id, text):
     mp3_path = "/tmp/reply.mp3"
     m4a_path = "/tmp/reply.m4a"
     try:
@@ -296,7 +409,8 @@ def send_voice_reply(ig_client, thread_id, text):
         if result.returncode != 0:
             raise RuntimeError(f"ffmpeg failed: {result.stderr.decode()}")
 
-        direct_send_voice(ig_client, m4a_path, thread_id)
+        audio_id = upload_web_audio(username, password, m4a_path)
+        send_web_voice(username, password, thread_id, audio_id)
         log.info(f"Sent voice reply: {text[:80]}{'...' if len(text) > 80 else ''}")
     finally:
         for path in (mp3_path, m4a_path):
@@ -413,7 +527,7 @@ def main():
                         if reply:
                             if random.random() < VOICE_CHANCE:
                                 try:
-                                    send_voice_reply(ig_client, thread_id, reply)
+                                    send_voice_reply(username, password, thread_id, reply)
                                 except Exception as e:
                                     log.warning(f"Voice reply failed, falling back to text: {e}")
                                     send_reply(ig_client, thread_id, reply)
