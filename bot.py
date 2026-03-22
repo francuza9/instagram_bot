@@ -247,7 +247,7 @@ def direct_send_voice(cl, path, thread_id):
         "X-Entity-Length": audio_len,
         "Content-Type": "application/octet-stream",
         "Content-Length": audio_len,
-        "X-Entity-Type": "audio/mp4",
+        "X-Entity-Type": "video/mp4",
         **headers,
     }
     cl.private.post(
