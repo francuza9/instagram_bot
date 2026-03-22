@@ -130,9 +130,9 @@ def fetch_messages(ig_client, thread_id):
     return messages
 
 
-def find_new_mentions(messages, last_timestamp, bot_name, replied_timestamps):
-    """Find new messages that @mention the bot, filtering to text-only."""
-    mentions = []
+def find_new_messages(messages, last_timestamp, replied_timestamps):
+    """Find new text messages, filtering out non-text and already-replied."""
+    new_msgs = []
     for msg in messages:
         if last_timestamp is not None and msg.timestamp <= last_timestamp:
             continue
@@ -140,9 +140,8 @@ def find_new_mentions(messages, last_timestamp, bot_name, replied_timestamps):
             continue
         if not msg.text:
             continue
-        if bot_name.lower() in msg.text.lower():
-            mentions.append(msg)
-    return mentions
+        new_msgs.append(msg)
+    return new_msgs
 
 
 def get_latest_timestamp(messages):
@@ -269,7 +268,7 @@ def main():
                     log.info("First run — no messages found in thread")
                 first_run = False
             else:
-                mentions = find_new_mentions(messages, last_timestamp, bot_name, replied_timestamps)
+                mentions = find_new_messages(messages, last_timestamp, replied_timestamps)
                 new_latest = get_latest_timestamp(messages)
                 if new_latest and (last_timestamp is None or new_latest > last_timestamp):
                     last_timestamp = new_latest
@@ -278,11 +277,11 @@ def main():
                     # Cooldown check — reply to most recent mention only
                     now = time.time()
                     if now - last_reply_time < REPLY_COOLDOWN:
-                        log.info(f"Cooldown active, skipping {len(mentions)} mention(s)")
+                        log.info(f"Cooldown active, skipping {len(mentions)} message(s)")
                     else:
                         trigger = mentions[-1]  # most recent mention
                         trigger_user = get_username(ig_client, trigger.user_id, username_cache)
-                        log.info(f"Mention from @{trigger_user}: {trigger.text[:80]}")
+                        log.info(f"New message from @{trigger_user}: {trigger.text[:80]}")
 
                         context = format_context(messages, ig_client, username_cache)
                         reply = generate_response(groq_client, context, system_prompt)
