@@ -96,26 +96,37 @@ Edit `config.py` to tweak bot behavior without touching credentials or code:
 | `REPLY_DELAY_MIN` / `REPLY_DELAY_MAX` | `1` / `3` | Delay before sending a reply (looks more human) |
 | `REPLY_COOLDOWN` | `15` | Minimum seconds between replies |
 | `CONTEXT_MESSAGES` | `20` | How many recent messages to send as context to the LLM |
-| `REACT_TO_REELS` | `False` | Enable reel reactions (requires `GEMINI_API_KEY`) |
+| `REACT_TO_REELS` | `"NONE"` | Reel reaction mode: `"FULL"` (video), `"LITE"` (thumbnail+caption, recommended), or `"NONE"` (disabled). Requires `GEMINI_API_KEY` |
 
 ## Reel Reactions Setup
 
-The bot can "watch" reels shared in the DM thread and reply with a short, in-character reaction. This uses Google Gemini 2.5 Flash as a vision model — it's free with no credit card required.
+The bot can react to reels shared in the DM thread using Google Gemini 2.5 Flash — free with no credit card required. There are three modes:
+
+| Mode | Speed | What it does |
+|------|-------|-------------|
+| `"LITE"` | Fast (seconds) | Downloads the reel thumbnail + fetches the caption, sends to Gemini. **Recommended for most users.** |
+| `"FULL"` | Slow (up to 60s) | Downloads the full video, uploads to Gemini. Sees everything but takes much longer. |
+| `"NONE"` | — | Disabled, bot ignores reels entirely. (Default) |
 
 1. **Get a free Gemini API key** at [aistudio.google.com/apikey](https://aistudio.google.com/apikey)
 
 2. **Add to your `.env`:**
 
    ```
-   REACT_TO_REELS=true
    GEMINI_API_KEY=your_gemini_api_key
    ```
 
-3. **That's it.** The bot will now download reels shared in the thread, send them to Gemini for analysis, and reply directly to the reel message with a reaction.
+3. **Set the mode in `config.py`:**
+
+   ```python
+   REACT_TO_REELS = "LITE"   # recommended
+   ```
+
+4. **That's it.** The bot will react to reels shared in the thread using the selected mode.
 
 **Free tier limits:** 10 requests/minute, 250 requests/day, 250K tokens/minute. The bot gracefully skips reels if rate limited — no crashes, no retries.
 
-**How it works:** When someone shares a reel, the bot downloads the video, uploads it to Gemini's File API, and asks Gemini to react using the same personality from `system_prompt.txt`. The reply is threaded directly to the reel message. Reel reactions are always text — voice notes only apply to regular text replies.
+**How it works:** In LITE mode, the bot grabs the reel's thumbnail image and caption, sends them to Gemini, and gets back a reaction in seconds. In FULL mode, it downloads the entire video, uploads it to Gemini's File API, and waits for processing. Both modes reply threaded directly to the reel message using the same personality from `system_prompt.txt`. Reel reactions are always text — voice notes only apply to regular text replies.
 
 ## How It Works
 

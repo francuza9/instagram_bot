@@ -56,6 +56,10 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# Suppress noisy HTTP-level logs from Gemini SDK
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 # --- Global state ---
 running = True
 _web_tokens = {}
@@ -191,7 +195,6 @@ def find_new_messages(messages, last_timestamp, replied_timestamps, bot_user_id,
 
 def find_new_reels(messages, last_timestamp, replied_timestamps, bot_user_id):
     """Find new reel messages that haven't been reacted to yet."""
-    log.info(f"[DEBUG] find_new_reels called with {len(messages)} messages, last_timestamp={last_timestamp}")
     new_reels = []
     for msg in messages:
         if int(msg.user_id) == int(bot_user_id):
@@ -574,6 +577,96 @@ def process_reel(ig_client, gemini_client, reel_msg, media_pk, context, system_p
                 pass
 
 
+def process_reel_lite(ig_client, gemini_client, reel_msg, media_pk, context, system_prompt, username_cache):
+    """Use reel thumbnail + caption for a fast Gemini reaction (LITE mode)."""
+    from google.genai import types
+    import tempfile
+
+    tmp_path = None
+    gemini_file = None
+    try:
+        # 1. Get preview image URL and caption via media_info
+        preview_url = None
+        caption = None
+        if reel_msg.xma_share:
+            preview_url = getattr(reel_msg.xma_share, 'preview_url', None)
+
+        # Fetch media_info for thumbnail fallback and caption
+        try:
+            media_info = ig_client.media_info(media_pk)
+            caption = getattr(media_info, 'caption_text', None)
+            if not preview_url and media_info.thumbnail_url:
+                preview_url = str(media_info.thumbnail_url)
+        except Exception as e:
+            log.debug(f"Could not fetch media_info for reel {media_pk}: {e}")
+
+        if not preview_url:
+            log.warning(f"No preview_url available for reel {media_pk} — skipping (LITE mode)")
+            return None
+
+        # 2. Download thumbnail image
+        resp = requests.get(str(preview_url), timeout=15)
+        resp.raise_for_status()
+
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
+            f.write(resp.content)
+            tmp_path = f.name
+        log.info(f"Downloaded reel thumbnail for {media_pk} ({len(resp.content)} bytes)")
+
+        # 4. Upload image to Gemini (no processing wait needed)
+        gemini_file = gemini_client.files.upload(file=tmp_path, config={"mime_type": "image/jpeg"})
+        log.info("Uploaded reel thumbnail to Gemini")
+
+        # 5. Build prompt
+        sender = get_username(ig_client, reel_msg.user_id, username_cache)
+
+        caption_line = f'\nThe reel\'s caption is: "{caption}"' if caption else ""
+
+        reel_prompt = (
+            f"{system_prompt}\n\n"
+            f"Recent chat context:\n{context}\n\n"
+            f"@{sender} just sent a reel in the chat. "
+            f"Here is the reel's thumbnail image.{caption_line}\n"
+            f"React naturally like you would in a group chat. "
+            f"Keep it short (1-2 sentences max). Be funny, sarcastic, or savage as appropriate. "
+            f"Don't describe the image — just react to the reel."
+        )
+
+        # 6. Generate reaction
+        response = gemini_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[gemini_file, reel_prompt],
+            config=types.GenerateContentConfig(
+                temperature=0.9,
+                max_output_tokens=256,
+            ),
+        )
+        reply = response.text.strip() if response.text else None
+        if reply:
+            reply = re.sub(r'^(\[.*?\]|[\w]+):\s*', '', reply)
+        log.info(f"Gemini LITE reaction: {reply[:80] if reply else '<empty>'}")
+        return reply
+
+    except Exception as e:
+        error_str = str(e)
+        if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+            log.warning(f"Gemini rate limited, skipping reel {media_pk}")
+        else:
+            log.error(f"Error processing reel {media_pk} (LITE): {e}", exc_info=True)
+        return None
+    finally:
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        if gemini_file:
+            try:
+                gemini_client.files.delete(name=gemini_file.name)
+            except Exception:
+                pass
+
+
 def main():
     load_dotenv()
 
@@ -641,23 +734,29 @@ def main():
         VOICE_CHANCE = 0
 
     # Reel reaction setup
-    REACT_TO_REELS = _REACT_TO_REELS_DEFAULT
-    log.info(f"[DEBUG] REACT_TO_REELS = {REACT_TO_REELS}")
+    REACT_TO_REELS = str(_REACT_TO_REELS_DEFAULT).upper()
+    # Backward compat: treat old boolean values
+    if REACT_TO_REELS == "TRUE":
+        REACT_TO_REELS = "FULL"
+    elif REACT_TO_REELS == "FALSE":
+        REACT_TO_REELS = "NONE"
+    if REACT_TO_REELS not in ("FULL", "LITE", "NONE"):
+        log.warning(f"Invalid REACT_TO_REELS value '{_REACT_TO_REELS_DEFAULT}' — defaulting to NONE")
+        REACT_TO_REELS = "NONE"
     gemini_client = None
-    if REACT_TO_REELS:
+    if REACT_TO_REELS != "NONE":
         gemini_api_key = os.getenv("GEMINI_API_KEY")
         if not gemini_api_key:
             log.warning("REACT_TO_REELS enabled but GEMINI_API_KEY not set — reel reactions disabled.")
-            REACT_TO_REELS = False
+            REACT_TO_REELS = "NONE"
         else:
             try:
                 from google import genai
                 gemini_client = genai.Client(api_key=gemini_api_key)
-                log.info(f"[DEBUG] Gemini client created: {gemini_client}")
-                log.info("Gemini configured — reel reactions enabled.")
+                log.info(f"Gemini configured — reel reactions enabled ({REACT_TO_REELS} mode).")
             except Exception as e:
                 log.warning(f"Gemini setup failed: {e} — reel reactions disabled.")
-                REACT_TO_REELS = False
+                REACT_TO_REELS = "NONE"
 
     bot_user_id = int(ig_client.user_id)
     log.info(f"Bot user_id: {bot_user_id} (type: {type(bot_user_id).__name__})")
@@ -670,7 +769,8 @@ def main():
     print(f"  Thread:   {thread_id}")
     print(f"  Bot name: @{bot_name}")
     print(f"  Model:    llama-3.3-70b-versatile (Groq)")
-    print(f"  Reels:    {'Gemini 2.5 Flash' if REACT_TO_REELS else 'disabled'}")
+    reels_status = f"{REACT_TO_REELS} (Gemini 2.5 Flash)" if REACT_TO_REELS != "NONE" else "disabled"
+    print(f"  Reels:    {reels_status}")
     print("=" * 50)
     print()
 
@@ -690,7 +790,7 @@ def main():
                 first_run = False
             else:
                 mentions = find_new_messages(messages, last_timestamp, replied_timestamps, bot_user_id, bot_name)
-                reel_triggers = find_new_reels(messages, last_timestamp, replied_timestamps, bot_user_id) if REACT_TO_REELS else []
+                reel_triggers = find_new_reels(messages, last_timestamp, replied_timestamps, bot_user_id) if REACT_TO_REELS != "NONE" else []
 
                 new_latest = get_latest_timestamp(messages)
                 if new_latest and (last_timestamp is None or new_latest > last_timestamp):
@@ -729,10 +829,10 @@ def main():
                                 replied_timestamps.add(m.timestamp)
 
                 # Reel reactions (independent of text replies)
-                if REACT_TO_REELS and gemini_client and reel_triggers:
+                if REACT_TO_REELS != "NONE" and gemini_client and reel_triggers:
                     reel_msg = reel_triggers[-1]  # most recent reel
                     reel_user = get_username(ig_client, reel_msg.user_id, username_cache)
-                    log.info(f"New reel from @{reel_user}")
+                    log.info(f"New reel from @{reel_user} (mode: {REACT_TO_REELS})")
 
                     _, media_pk = extract_reel_media(reel_msg)
                     if media_pk is None:
@@ -741,10 +841,16 @@ def main():
                             replied_timestamps.add(m.timestamp)
                     else:
                         context = format_context(messages, ig_client, username_cache)
-                        reel_reply = process_reel(
-                            ig_client, gemini_client, reel_msg, media_pk,
-                            context, system_prompt, username_cache
-                        )
+                        if REACT_TO_REELS == "LITE":
+                            reel_reply = process_reel_lite(
+                                ig_client, gemini_client, reel_msg, media_pk,
+                                context, system_prompt, username_cache
+                            )
+                        else:
+                            reel_reply = process_reel(
+                                ig_client, gemini_client, reel_msg, media_pk,
+                                context, system_prompt, username_cache
+                            )
 
                         if reel_reply:
                             delay = random.uniform(REPLY_DELAY_MIN, REPLY_DELAY_MAX)

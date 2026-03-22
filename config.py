@@ -25,4 +25,7 @@ REPLY_DELAY_MAX = 3
 REPLY_COOLDOWN = 15
 
 # React to reels shared in the DM thread (requires GEMINI_API_KEY)
-REACT_TO_REELS = True
+# Options: "FULL" — download full video, upload to Gemini (slow but sees everything)
+#          "LITE" — use thumbnail image + caption, much faster (recommended)
+#          "NONE" — disabled, bot ignores reels entirely
+REACT_TO_REELS = "LITE"
