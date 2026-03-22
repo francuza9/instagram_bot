@@ -35,8 +35,9 @@ MAX_LOGIN_RETRIES = 3
 REPLY_COOLDOWN = 15  # seconds between replies
 
 # --- Logging ---
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
-    level=logging.INFO,
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
@@ -130,10 +131,12 @@ def fetch_messages(ig_client, thread_id):
     return messages
 
 
-def find_new_messages(messages, last_timestamp, replied_timestamps):
-    """Find new text messages, filtering out non-text and already-replied."""
+def find_new_messages(messages, last_timestamp, replied_timestamps, bot_user_id):
+    """Find new text messages, filtering out non-text, already-replied, and own messages."""
     new_msgs = []
     for msg in messages:
+        if msg.user_id == bot_user_id:
+            continue
         if last_timestamp is not None and msg.timestamp <= last_timestamp:
             continue
         if msg.timestamp in replied_timestamps:
@@ -266,12 +269,15 @@ def main():
                     log.info(f"First run — skipping existing messages (latest: {last_timestamp})")
                 else:
                     log.info("First run — no messages found in thread")
+                log.debug(f"Initial last_timestamp set to {last_timestamp}")
                 first_run = False
             else:
-                mentions = find_new_messages(messages, last_timestamp, replied_timestamps)
+                mentions = find_new_messages(messages, last_timestamp, replied_timestamps, ig_client.user_id)
                 new_latest = get_latest_timestamp(messages)
                 if new_latest and (last_timestamp is None or new_latest > last_timestamp):
                     last_timestamp = new_latest
+                log.debug(f"Poll state: last_timestamp={last_timestamp}, replied_timestamps={replied_timestamps}")
+                log.debug(f"Found {len(mentions)} new message(s)")
 
                 if mentions:
                     # Cooldown check — reply to most recent mention only
